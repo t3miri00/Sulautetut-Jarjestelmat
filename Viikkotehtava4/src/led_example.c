@@ -6,9 +6,10 @@
 #include <ctype.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdarg.h>
 #include <zephyr/timing/timing.h>
 
-/* UART device */
+/* ---------- Config / devices ---------- */
 #define UART_DEVICE_NODE DT_CHOSEN(zephyr_shell_uart)
 static const struct device *const uart_dev = DEVICE_DT_GET(UART_DEVICE_NODE);
 
@@ -19,11 +20,11 @@ static const struct gpio_dt_spec red   = GPIO_DT_SPEC_GET(LED_RED_NODE, gpios);
 static const struct gpio_dt_spec green = GPIO_DT_SPEC_GET(LED_GREEN_NODE, gpios);
 
 /* Buttons */
-#define BUTTON_0 DT_ALIAS(sw0)   // Pause
+#define BUTTON_0 DT_ALIAS(sw0)   // Pause toggle
 #define BUTTON_1 DT_ALIAS(sw1)   // Manual RED
 #define BUTTON_2 DT_ALIAS(sw2)   // Manual YELLOW
 #define BUTTON_3 DT_ALIAS(sw3)   // Manual GREEN
-#define BUTTON_4 DT_ALIAS(sw4)   // not used but works
+#define BUTTON_4 DT_ALIAS(sw4)   // Debug ON/OFF toggle
 
 static const struct gpio_dt_spec button_0 = GPIO_DT_SPEC_GET_OR(BUTTON_0, gpios, {0});
 static const struct gpio_dt_spec button_1 = GPIO_DT_SPEC_GET_OR(BUTTON_1, gpios, {1});
@@ -37,13 +38,16 @@ static struct gpio_callback button_2_cb_data;
 static struct gpio_callback button_3_cb_data;
 static struct gpio_callback button_4_cb_data;
 
-/* LED Helpers */
+/* ---------- Helpers ---------- */
 static void set_red(bool on)   { gpio_pin_set_dt(&red, on ? 1 : 0); }
 static void set_green(bool on) { gpio_pin_set_dt(&green, on ? 1 : 0); }
 static void set_yellow(bool on) { set_red(on); set_green(on); }
 
-/* Pausetoggle */
-volatile bool paused = false;
+/* Timing init called once in main() */
+ 
+/* ---------- Run-time flags ---------- */
+volatile bool paused = false;         // pause state
+volatile bool debug_enabled = false;  // debug ON/OFF toggled by Button4
 
 /* ---------- FIFO / dispatcher infra ---------- */
 struct fifo_item {
@@ -53,7 +57,7 @@ struct fifo_item {
 };
 K_FIFO_DEFINE(dispatcher_fifo);
 
-/* Condition vars & mutexes */
+/* Condition vars & mutexes for LED tasks */
 K_MUTEX_DEFINE(red_mutex);
 K_CONDVAR_DEFINE(red_cond);
 static bool red_pending = false;
@@ -72,7 +76,34 @@ static uint32_t green_duration = 1000;
 /* Dispatcher waits release */
 K_SEM_DEFINE(release_sem, 0, 1);
 
-/* ---------- Helper: push to FIFO ---------- */
+/* ---------- Debug FIFO (messages only when debug_enabled) ---------- */
+struct debug_msg {
+    void *fifo_reserved;
+    char text[128];
+};
+K_FIFO_DEFINE(debug_fifo);
+
+/* Helper: push debug message into debug_fifo IF debug_enabled.
+   We keep this non-blocking-ish (allocate; if allocation fails we drop the message). */
+static void debug_log(const char *fmt, ...)
+{
+    if (!debug_enabled) {
+        return; /* do nothing when debug disabled */
+    }
+
+    struct debug_msg *m = k_malloc(sizeof(*m));
+    if (!m) {
+        return;
+    }
+    va_list args;
+    va_start(args, fmt);
+    vsnprintk(m->text, sizeof(m->text), fmt, args);
+    va_end(args);
+
+    k_fifo_put(&debug_fifo, m);
+}
+
+/* ---------- Push color helper (prints push via debug_log) ---------- */
 static void push_color_to_fifo(char c, uint32_t duration_ms)
 {
     struct fifo_item *it = k_malloc(sizeof(*it));
@@ -83,33 +114,47 @@ static void push_color_to_fifo(char c, uint32_t duration_ms)
     it->color = (char)toupper((unsigned char)c);
     it->duration_ms = duration_ms;
     k_fifo_put(&dispatcher_fifo, it);
-    printk("PUSH FIFO: %c, %u ms\n", it->color, it->duration_ms);
+    debug_log("PUSH FIFO: %c, %u ms\n", it->color, it->duration_ms);
 }
 
 /* ---------- Button handlers ---------- */
+/* Button0 toggles pause */
 void button_0_handler(const struct device *dev, struct gpio_callback *cb, uint32_t pins)
 {
     paused = !paused;
     printk("Button0 pressed: pause status=%d\n", (int)paused);
 }
+
+/* Buttons 1-3 push manual colors */
 void button_1_handler(const struct device *dev, struct gpio_callback *cb, uint32_t pins)
 {
     if (paused) push_color_to_fifo('R', 1000);
-    else printk("Button1 ignored (paused)\n");
+    else debug_log("Button1 pressed but pause active -> ignored\n");
 }
 void button_2_handler(const struct device *dev, struct gpio_callback *cb, uint32_t pins)
 {
     if (paused) push_color_to_fifo('Y', 1000);
-    else printk("Button2 ignored (paused)\n");
+    else debug_log("Button2 pressed but pause active -> ignored\n");
 }
 void button_3_handler(const struct device *dev, struct gpio_callback *cb, uint32_t pins)
 {
     if (paused) push_color_to_fifo('G', 1000);
-    else printk("Button3 ignored (paused)\n");
+    else debug_log("Button3 pressed but pause active -> ignored\n");
 }
+
+/* Button4 toggles debug mode ON/OFF*/
 void button_4_handler(const struct device *dev, struct gpio_callback *cb, uint32_t pins)
 {
-    printk("Button4 pressed (unused)\n");
+    debug_enabled = !debug_enabled;
+    if (debug_enabled) {
+        printk("DEBUG MODE: ON\n");
+    } else {
+        printk("DEBUG MODE: OFF\n");
+        struct debug_msg *m;
+        while ((m = k_fifo_get(&debug_fifo, K_NO_WAIT)) != NULL) {
+            k_free(m);
+        }
+    }
 }
 
 /* ---------- Buttons init ---------- */
@@ -126,8 +171,16 @@ static int init_buttons_and_callbacks(void)
             printk("Button %d port not ready\n", i);
             return -1;
         }
-        gpio_pin_configure_dt(buttons[i], GPIO_INPUT);
-        gpio_pin_interrupt_configure_dt(buttons[i], GPIO_INT_EDGE_TO_ACTIVE);
+        int ret = gpio_pin_configure_dt(buttons[i], GPIO_INPUT);
+        if (ret) {
+            printk("Failed to configure button %d pin\n", i);
+            return -1;
+        }
+        ret = gpio_pin_interrupt_configure_dt(buttons[i], GPIO_INT_EDGE_TO_ACTIVE);
+        if (ret) {
+            printk("Failed to configure interrupt for button %d\n", i);
+            return -1;
+        }
         gpio_init_callback(cbs[i], handlers[i], BIT(buttons[i]->pin));
         gpio_add_callback(buttons[i]->port, cbs[i]);
         printk("Button %d set ok\n", i);
@@ -143,27 +196,40 @@ void uart_task(void *p1, void *p2, void *p3)
 {
     char buf[32];
     int idx = 0;
-    printk("UART task started\n");
+
+    debug_log("UART task started\n");
 
     while (1) {
         unsigned char c;
         if (uart_poll_in(uart_dev, &c) == 0) {
+            if (idx == 0) {
+            }
+
             if (c == '\r' || c == '\n') {
-                buf[idx] = '\0';
                 if (idx > 0) {
+                    buf[idx] = '\0';
+                    timing_t ustart = timing_counter_get();
+
                     char color = toupper((unsigned char)buf[0]);
                     uint32_t dur = 1000;
                     char *comma = strchr(buf, ',');
                     if (comma) {
-                        dur = strtoul(comma + 1, NULL, 10);
+                        dur = (uint32_t)strtoul(comma + 1, NULL, 10);
                     }
                     if (color == 'R' || color == 'Y' || color == 'G') {
                         push_color_to_fifo(color, dur);
+                    } else {
+                        debug_log("UART: unknown color '%c' ignored\n", color);
                     }
+
+                    timing_t uend = timing_counter_get();
+                    uint64_t ucyc = timing_cycles_get(&ustart, &uend);
+                    uint64_t usec = timing_cycles_to_ns(ucyc) / 1000;
+                    debug_log("UART sequence handling time: %llu us\n", usec);
                 }
                 idx = 0;
             } else {
-                if (idx < sizeof(buf) - 1) {
+                if (idx < (int)sizeof(buf) - 1) {
                     buf[idx++] = (char)c;
                 }
             }
@@ -175,13 +241,17 @@ void uart_task(void *p1, void *p2, void *p3)
 /* ---------- Dispatcher ---------- */
 void dispatcher_task(void *p1, void *p2, void *p3)
 {
-    printk("Dispatcher task started\n");
+    debug_log("Dispatcher task started\n");
+
     while (1) {
         struct fifo_item *it = k_fifo_get(&dispatcher_fifo, K_FOREVER);
         if (!it) continue;
+
+        timing_t seq_start = timing_counter_get();
+
         char c = it->color;
         uint32_t dur = it->duration_ms;
-        printk("Dispatcher got: %c, %u ms\n", c, dur);
+        debug_log("Dispatcher got: %c, %u ms\n", c, dur);
 
         if (c == 'R') {
             k_mutex_lock(&red_mutex, K_FOREVER);
@@ -204,19 +274,25 @@ void dispatcher_task(void *p1, void *p2, void *p3)
         }
 
         k_sem_take(&release_sem, K_FOREVER);
-        printk("Dispatcher: release received\n");
+
+        /* measure end */
+        timing_t seq_end = timing_counter_get();
+        uint64_t seq_cyc = timing_cycles_get(&seq_start, &seq_end);
+        uint64_t seq_usec = timing_cycles_to_ns(seq_cyc) / 1000;
+        debug_log("Full sequence runtime: %llu us\n", seq_usec);
 
         k_free(it);
     }
 }
 
-/* ---------- LED tasks with corrected timing ---------- */
+/* ---------- LED tasks ---------- */
 void red_task(void *p1, void *p2, void *p3)
 {
     while (1) {
         k_mutex_lock(&red_mutex, K_FOREVER);
-        while (!red_pending)
+        while (!red_pending) {
             k_condvar_wait(&red_cond, &red_mutex, K_FOREVER);
+        }
         red_pending = false;
         uint32_t dur = red_duration;
         k_mutex_unlock(&red_mutex);
@@ -230,7 +306,7 @@ void red_task(void *p1, void *p2, void *p3)
         timing_t end = timing_counter_get();
         uint64_t cyc = timing_cycles_get(&start, &end);
         uint64_t usec = timing_cycles_to_ns(cyc) / 1000;
-        printk("RED task runtime: %llu us\n", usec);
+        debug_log("RED task runtime: %llu us\n", usec);
 
         k_sem_give(&release_sem);
     }
@@ -240,8 +316,9 @@ void yellow_task(void *p1, void *p2, void *p3)
 {
     while (1) {
         k_mutex_lock(&yellow_mutex, K_FOREVER);
-        while (!yellow_pending)
+        while (!yellow_pending) {
             k_condvar_wait(&yellow_cond, &yellow_mutex, K_FOREVER);
+        }
         yellow_pending = false;
         uint32_t dur = yellow_duration;
         k_mutex_unlock(&yellow_mutex);
@@ -255,7 +332,7 @@ void yellow_task(void *p1, void *p2, void *p3)
         timing_t end = timing_counter_get();
         uint64_t cyc = timing_cycles_get(&start, &end);
         uint64_t usec = timing_cycles_to_ns(cyc) / 1000;
-        printk("YELLOW task runtime: %llu us\n", usec);
+        debug_log("YELLOW task runtime: %llu us\n", usec);
 
         k_sem_give(&release_sem);
     }
@@ -265,8 +342,9 @@ void green_task(void *p1, void *p2, void *p3)
 {
     while (1) {
         k_mutex_lock(&green_mutex, K_FOREVER);
-        while (!green_pending)
+        while (!green_pending) {
             k_condvar_wait(&green_cond, &green_mutex, K_FOREVER);
+        }
         green_pending = false;
         uint32_t dur = green_duration;
         k_mutex_unlock(&green_mutex);
@@ -280,9 +358,22 @@ void green_task(void *p1, void *p2, void *p3)
         timing_t end = timing_counter_get();
         uint64_t cyc = timing_cycles_get(&start, &end);
         uint64_t usec = timing_cycles_to_ns(cyc) / 1000;
-        printk("GREEN task runtime: %llu us\n", usec);
+        debug_log("GREEN task runtime: %llu us\n", usec);
 
         k_sem_give(&release_sem);
+    }
+}
+
+/* ---------- Debug task: prints queued debug messages (only when debug_enabled messages are queued) ---------- */
+void debug_task(void *p1, void *p2, void *p3)
+{
+    printk("Debug task started (prints only when DEBUG MODE ON and messages queued)\n");
+    while (1) {
+        struct debug_msg *m = k_fifo_get(&debug_fifo, K_FOREVER);
+        if (m) {
+            printk("%s", m->text);
+            k_free(m);
+        }
     }
 }
 
@@ -292,15 +383,16 @@ K_THREAD_DEFINE(dispatcher_tid, STACKSIZE, dispatcher_task, NULL, NULL, NULL, PR
 K_THREAD_DEFINE(red_tid, STACKSIZE, red_task, NULL, NULL, NULL, PRIORITY, 0, 0);
 K_THREAD_DEFINE(yellow_tid, STACKSIZE, yellow_task, NULL, NULL, NULL, PRIORITY, 0, 0);
 K_THREAD_DEFINE(green_tid, STACKSIZE, green_task, NULL, NULL, NULL, PRIORITY, 0, 0);
+K_THREAD_DEFINE(debug_tid, STACKSIZE, debug_task, NULL, NULL, NULL, PRIORITY, 0, 0);
 
 /* ---------- Main ---------- */
 int main(void)
 {
-    /* timing init moved here globally */
+    /* initialize timing once */
     timing_init();
     timing_start();
 
-    printk("Traffic light started\n");
+    printk("Traffic light system starting\n");
 
     if (!device_is_ready(uart_dev)) {
         printk("UART not ready\n");
@@ -310,6 +402,7 @@ int main(void)
         printk("LEDs not ready\n");
         return -1;
     }
+
     gpio_pin_configure_dt(&red, GPIO_OUTPUT_INACTIVE);
     gpio_pin_configure_dt(&green, GPIO_OUTPUT_INACTIVE);
 
@@ -318,16 +411,16 @@ int main(void)
         return -1;
     }
 
-    printk("System online.\n To use - Send SerialTerminal-commands: R,2000\\Y,500\\G,1500\\r,y,g\n");
+    printk("System online. Use serial commands like: R,2000\\r Y,1000\\r G,1500\\r\n");
+    printk("Toggle debug output with BUTTON4 (DEBUG MODE ON/OFF)\n");
+
     while (1) {
         k_sleep(K_SECONDS(60));
     }
     return 0;
 }
 
-
-/* Koodiin seuraavat toiminnot ja ominaisuudeet lisätty:
-+1p suoritus: Ajoitukset liikennevaloihin
-+1p suoritus: Debug-taski
-+1p suoritus: Lisäajoitustietoja
-*/
+/* Koodiin seuraavat toiminnot ja ominaisuudeet lisätty: 
++1p suoritus: Ajoitukset liikennevaloihin 
++1p suoritus: Debug-taski, joka menee päälle ja pois Button 4:stä
++1p suoritus: Lisäajoitustietoja */
